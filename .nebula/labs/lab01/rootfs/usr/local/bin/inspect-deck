@@ -1,0 +1,3 @@
+#!/bin/sh
+# Asks Officer Ruiz to inspect Deck 3 (Lab 01, challenge lab01-6).
+exec /usr/local/lib/nebula-agent check lab01-6

@@ -1,0 +1,82 @@
+{
+  "id": "lab01",
+  "day": 1,
+  "title": "Linux I - Welcome aboard Vega-7",
+  "briefing": "missions/lab01-linux-1.md",
+  "container": "nebula-lab01",
+  "image": "nebula/lab01:1",
+  "hostname": "vega7-ws042",
+  "user": "cadet",
+  "challenges": [
+    {
+      "id": "lab01-1",
+      "title": "First Contact",
+      "points": 100,
+      "type": "flag",
+      "summary": "Read the welcome letter waiting in your home folder.",
+      "hints": [
+        "Use `ls` to list the files in the folder where you are.",
+        "Use `cat <file>` to print the content of a file."
+      ]
+    },
+    {
+      "id": "lab01-2",
+      "title": "Hidden in Plain Sight",
+      "points": 100,
+      "type": "flag",
+      "summary": "Your access badge is in your home folder... but `ls` does not show it.",
+      "hints": [
+        "On Linux, files whose names start with a dot (.) are hidden.",
+        "`ls -a` (or `ls -la`) also lists hidden files."
+      ]
+    },
+    {
+      "id": "lab01-3",
+      "title": "Station Map",
+      "points": 100,
+      "type": "flag",
+      "summary": "Find the main configuration file of the station and read its onboarding code.",
+      "hints": [
+        "Linux keeps configuration files in one specific top-level folder. Check 'Folder Structure' in the CheatSheets.",
+        "Go to /etc with `cd /etc` and look for a folder named after the company.",
+        "Inside that folder, `ls` and then `cat` the file that looks like the station configuration."
+      ]
+    },
+    {
+      "id": "lab01-4",
+      "title": "The Captain's Log",
+      "points": 200,
+      "type": "flag",
+      "summary": "The captain left a PRIVATE note somewhere inside a very long log file.",
+      "hints": [
+        "Logs usually live under /var/log. Look for the station's folder there.",
+        "The file has thousands of lines. Open it with `less <file>`, type `/PRIVATE` and press Enter to search.",
+        "Inside less: `n` jumps to the next match, `q` quits."
+      ]
+    },
+    {
+      "id": "lab01-5",
+      "title": "Not What It Seems",
+      "points": 200,
+      "type": "flag",
+      "summary": "In ~/cargo one file is lying about what it is. Find it and read it.",
+      "hints": [
+        "An extension (.jpg, .pdf...) is just part of the name. The `file` command looks at the real content.",
+        "Go into the cargo folder and run `file *` to inspect every file at once.",
+        "Look for the file that `file` reports as text even though its name says otherwise."
+      ]
+    },
+    {
+      "id": "lab01-6",
+      "title": "Tidy Up the Deck",
+      "points": 300,
+      "type": "task",
+      "summary": "Follow the orders in ~/deck/README_FIRST.txt and pass the inspection with `inspect-deck`.",
+      "hints": [
+        "`mkdir -p a/b/c` creates nested folders in one go.",
+        "Wildcards save time: `mv *.log logs/` moves every file ending in .log.",
+        "`cp` copies (the original stays), `mv` moves (the original disappears), `rm` deletes."
+      ]
+    }
+  ]
+}

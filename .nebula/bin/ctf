@@ -1,0 +1,520 @@
+#!/usr/bin/env python3
+"""ctf - Nebula cadet console.
+
+Your interface to the Nebula labs: start disposable lab environments,
+ask for hints and submit the NEBULA{...} flags you find.
+
+Run `ctf help` to see all commands.
+"""
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+NEBULA = os.path.join(ROOT, ".nebula")
+AGENT = os.path.join(NEBULA, "bin", "nebula-agent")
+LABS_DIR = os.path.join(NEBULA, "labs")
+PROFILE = os.path.join(NEBULA, "profile.json")
+LOG = os.path.join(NEBULA, "progress", "log.jsonl")
+CONFIG = os.path.join(NEBULA, "config.json")
+
+# ----------------------------------------------------------------- styling
+_TTY = sys.stdout.isatty()
+
+
+def _c(code: str, text: str) -> str:
+    return f"\033[{code}m{text}\033[0m" if _TTY else text
+
+
+def bold(t): return _c("1", t)
+def dim(t): return _c("2", t)
+def cyan(t): return _c("1;36", t)
+def magenta(t): return _c("1;35", t)
+def green(t): return _c("1;32", t)
+def yellow(t): return _c("1;33", t)
+def red(t): return _c("1;31", t)
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(red("✖ ") + msg)
+    sys.exit(code)
+
+
+def info(msg: str) -> None:
+    print(cyan("› ") + msg)
+
+
+# ----------------------------------------------------------------- data
+def load_json(path, default=None):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
+
+
+def config() -> dict:
+    return load_json(CONFIG, {}) or {}
+
+
+def labs() -> dict:
+    out = {}
+    if os.path.isdir(LABS_DIR):
+        for name in sorted(os.listdir(LABS_DIR)):
+            lab = load_json(os.path.join(LABS_DIR, name, "lab.json"))
+            if lab:
+                lab["_dir"] = os.path.join(LABS_DIR, name)
+                out[lab["id"]] = lab
+    return out
+
+
+def challenges() -> dict:
+    out = {}
+    for lab in labs().values():
+        for ch in lab["challenges"]:
+            out[ch["id"]] = dict(ch, lab=lab["id"])
+    return out
+
+
+def read_log() -> list:
+    entries = []
+    try:
+        with open(LOG) as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return entries
+
+
+def solved() -> dict:
+    return {e["challenge"]: e for e in read_log() if e.get("type") == "solve"}
+
+
+def hints_used() -> dict:
+    used = {}
+    for e in read_log():
+        if e.get("type") == "hint":
+            used[e["challenge"]] = max(used.get(e["challenge"], 0), e.get("level", 0))
+    return used
+
+
+def now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ----------------------------------------------------------------- identity / git
+def run(cmd, **kw):
+    return subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, **kw)
+
+
+def repo_slug():
+    """Return (owner, repo) from the origin remote."""
+    r = run(["git", "remote", "get-url", "origin"])
+    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", r.stdout.strip())
+    if m:
+        return m.group(1), m.group(2)
+    gr = os.environ.get("GITHUB_REPOSITORY", "")
+    if "/" in gr:
+        return tuple(gr.split("/", 1))
+    return None, None
+
+
+def login() -> str:
+    owner, _ = repo_slug()
+    user = owner or os.environ.get("GITHUB_USER", "")
+    if not user:
+        die("I could not figure out your GitHub username. Are you inside your Codespace?")
+    return user
+
+
+def guard_not_template():
+    owner, repo = repo_slug()
+    tpl = config().get("template_repo", "")
+    if tpl and owner and f"{owner}/{repo}".lower() == tpl.lower():
+        die("You are working on the course TEMPLATE, not on your own copy.\n"
+            "  Go to the template page on GitHub, click 'Use this template' → 'Create a new repository',\n"
+            "  make it PRIVATE, and open a Codespace from YOUR new repository.")
+
+
+def git_save(message: str, paths: list) -> None:
+    """Commit the given paths and push. Never fails hard: progress stays saved locally."""
+    run(["git", "add", "--"] + paths)
+    c = run(["git", "commit", "-q", "-m", message, "--"] + paths)
+    if c.returncode != 0 and "nothing to commit" not in (c.stdout + c.stderr):
+        print(yellow("  ! Could not create the commit: ") + (c.stderr.strip() or c.stdout.strip()))
+        return
+    push(quiet=True)
+
+
+def push(quiet=False) -> bool:
+    p = run(["git", "push", "-q"])
+    if p.returncode != 0:
+        run(["git", "pull", "-q", "--rebase", "--autostash"])
+        p = run(["git", "push", "-q"])
+    if p.returncode == 0:
+        if not quiet:
+            print(green("✔ ") + "Progress synced with GitHub.")
+        else:
+            print(dim("  ↳ saved & pushed to GitHub (HQ will see it in a few minutes)"))
+        return True
+    print(yellow("  ! Saved locally but could not push to GitHub. Run `ctf sync` later."))
+    if not quiet:
+        print(dim("    " + p.stderr.strip()))
+    return False
+
+
+def unsynced() -> int:
+    r = run(["git", "rev-list", "--count", "@{u}..HEAD"])
+    try:
+        return int(r.stdout.strip())
+    except ValueError:
+        return 0
+
+
+def require_profile() -> dict:
+    prof = load_json(PROFILE)
+    if not prof:
+        die("You are not registered yet. Run: " + bold("ctf register"))
+    return prof
+
+
+# ----------------------------------------------------------------- docker
+def docker_ready(timeout=90) -> None:
+    if not shutil.which("docker"):
+        die("Docker is not available in this environment.")
+    start = time.time()
+    shown = False
+    while time.time() - start < timeout:
+        if subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+            return
+        if not shown:
+            info("Waiting for the Docker engine to wake up...")
+            shown = True
+        time.sleep(2)
+    die("Docker did not start. Try: Ctrl+Shift+P → 'Codespaces: Rebuild Container'.")
+
+
+def container_running(name: str) -> bool:
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "true"
+
+
+def get_lab(lab_id: str) -> dict:
+    all_labs = labs()
+    if lab_id not in all_labs:
+        die(f"Unknown lab '{lab_id}'. Available: {', '.join(all_labs) or 'none'}")
+    return all_labs[lab_id]
+
+
+# ----------------------------------------------------------------- commands
+def cmd_help(_args):
+    print(magenta("\n  NEBULA :: cadet console") + dim("   (station VEGA-7)\n"))
+    rows = [
+        ("ctf register", "Create your cadet profile (do this once)"),
+        ("ctf list [lab]", "Show labs, challenges and what you have solved"),
+        ("ctf mission <lab>", "Open the mission briefing of a lab"),
+        ("ctf start <lab>", "Launch the lab environment and enter it"),
+        ("ctf connect <lab>", "Re-enter a running lab"),
+        ("ctf reset <lab>", "Destroy and recreate a lab from scratch"),
+        ("ctf stop <lab|all>", "Destroy a lab environment"),
+        ("ctf hint <challenge>", "Get the next hint for a challenge"),
+        ("ctf submit <challenge> <flag>", "Submit a NEBULA{...} flag"),
+        ("ctf check <challenge>", "Run the automatic check of a task challenge"),
+        ("ctf status", "Your points and sync status"),
+        ("ctf sync", "Push pending progress to GitHub"),
+    ]
+    for cmd, desc in rows:
+        print(f"  {bold(cmd):<44} {desc}")
+    print(dim("\n  Example:  ctf start lab01   →   ctf submit lab01-1 NEBULA{...}\n"))
+
+
+def cmd_register(_args):
+    guard_not_template()
+    prof = load_json(PROFILE)
+    user = login()
+    if prof:
+        print(green("✔ ") + f"Already registered as agent {bold(prof['alias'])}.")
+    else:
+        print(magenta("\n  Welcome to NEBULA, cadet.\n"))
+        print("  Choose an " + bold("agent alias") + ". It is what appears on the public leaderboard")
+        print("  (use 3-20 letters, numbers, - or _; don't use your real name if you prefer privacy).\n")
+        while True:
+            alias = input("  Agent alias: ").strip()
+            if re.fullmatch(r"[A-Za-z0-9_-]{3,20}", alias):
+                break
+            print(yellow("  Use 3-20 characters: letters, numbers, - or _."))
+        prof = {"alias": alias, "registered_at": now(), "version": 1}
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(PROFILE, "w") as fh:
+            json.dump(prof, fh, indent=2)
+        if not os.path.exists(LOG):
+            open(LOG, "a").close()
+        git_save(f"ctf: register agent {alias}", [PROFILE, LOG])
+        print(green("\n✔ ") + f"Registered as agent {bold(alias)}.")
+
+    bot = config().get("hq_bot", "")
+    owner, repo = repo_slug()
+    if bot and owner:
+        print("\n  " + yellow("One last step (only once):") + " give Nebula HQ read access to your repository.")
+        print(f"  1. Open  {cyan(f'https://github.com/{owner}/{repo}/settings/access')}")
+        print(f"  2. Click 'Add people' and invite  {bold(bot)}")
+        print("  HQ accepts the invitation automatically and your points appear on the leaderboard.\n")
+    url = config().get("scoreboard_url")
+    if url:
+        print("  Leaderboard: " + cyan(url) + "\n")
+    print("  Next: " + bold("ctf list") + "  and then  " + bold("ctf start lab01") + "\n")
+    _ = user
+
+
+def cmd_list(args):
+    done = solved()
+    used = hints_used()
+    all_labs = labs()
+    if args:
+        all_labs = {args[0]: get_lab(args[0])}
+    total = earned = 0
+    for lab in all_labs.values():
+        pts = sum(c["points"] for c in lab["challenges"])
+        got = sum(c["points"] for c in lab["challenges"] if c["id"] in done)
+        total += pts
+        earned += got
+        print(f"\n  {magenta(lab['id'].upper())}  {bold(lab['title'])}   {dim(f'{got}/{pts} pts')}")
+        for ch in lab["challenges"]:
+            mark = green("✔") if ch["id"] in done else dim("·")
+            h = used.get(ch["id"], 0)
+            htxt = dim(f"  [{h} hint{'s' if h != 1 else ''}]") if h else ""
+            kind = dim(" (task)") if ch.get("type") == "task" else ""
+            print(f"   {mark} {ch['id']:<9} {ch['title']:<24} {ch['points']:>4} pts{kind}{htxt}")
+            if ch["id"] not in done:
+                print(dim(f"               {ch['summary']}"))
+    print(f"\n  {bold('Total:')} {earned}/{total} pts\n")
+
+
+def cmd_mission(args):
+    if not args:
+        die("Usage: ctf mission <lab>")
+    lab = get_lab(args[0])
+    path = os.path.join(ROOT, lab.get("briefing", ""))
+    if not os.path.isfile(path):
+        die("Briefing not found.")
+    if shutil.which("code"):
+        subprocess.run(["code", path])
+        info(f"Opened {os.path.relpath(path, ROOT)} in the editor (use the preview: Ctrl+Shift+V).")
+    else:
+        with open(path) as fh:
+            print(fh.read())
+
+
+def cmd_start(args, reset=False):
+    if not args:
+        die("Usage: ctf start <lab>")
+    require_profile()
+    lab = get_lab(args[0])
+    name = lab["container"]
+    docker_ready()
+
+    if container_running(name) and not reset:
+        info(f"{lab['id']} is already running. Connecting... " + dim("(use `ctf reset` to start fresh)"))
+        return cmd_connect(args)
+
+    subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+    if subprocess.run(["docker", "image", "inspect", lab["image"]], capture_output=True).returncode != 0:
+        info(f"Building the {lab['id']} environment (first time only, about a minute)...")
+        b = subprocess.run(["docker", "build", "-q", "-t", lab["image"], lab["_dir"]])
+        if b.returncode != 0:
+            die("The build failed. Check your internet connection and try again.")
+
+    info(f"Launching {bold(lab['title'])} ...")
+    cmd = ["docker", "run", "-d", "--name", name, "--hostname", lab.get("hostname", lab["id"]),
+           "-e", f"NEBULA_USER={login()}",
+           "-v", f"{AGENT}:/usr/local/lib/nebula-agent:ro",
+           "--label", "nebula.lab=" + lab["id"]]
+    if lab.get("network", "none") == "none":
+        cmd += ["--network", "none"]
+    cmd.append(lab["image"])
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        die("Could not start the lab: " + r.stderr.strip())
+
+    env = dict(os.environ, NEBULA_USER=login())
+    p = subprocess.run([AGENT, "plant", lab["id"], name], env=env)
+    if p.returncode != 0:
+        die("Could not prepare your personal flags (agent error). Try `ctf reset " + lab["id"] + "`.")
+
+    print(green("✔ ") + "Environment ready. " + dim("Briefing: " + lab.get("briefing", "")))
+    print(dim("  Entering the lab... type `exit` to come back here.\n"))
+    time.sleep(0.6)
+    cmd_connect(args)
+
+
+def cmd_connect(args):
+    if not args:
+        die("Usage: ctf connect <lab>")
+    lab = get_lab(args[0])
+    docker_ready()
+    if not container_running(lab["container"]):
+        die(f"{lab['id']} is not running. Start it with: ctf start {lab['id']}")
+    user = lab.get("user", "root")
+    workdir = f"/home/{user}" if user != "root" else "/root"
+    subprocess.run(["docker", "exec", "-it", "-u", user, "-w", workdir, lab["container"], "bash", "-l"])
+    print(dim("\n  Back in your Codespace. Submit flags with: ctf submit <challenge> NEBULA{...}\n"))
+
+
+def cmd_stop(args):
+    if not args:
+        die("Usage: ctf stop <lab|all>")
+    docker_ready()
+    if args[0] == "all":
+        names = [lab["container"] for lab in labs().values()]
+    else:
+        names = [get_lab(args[0])["container"]]
+    for n in names:
+        subprocess.run(["docker", "rm", "-f", n], capture_output=True)
+    print(green("✔ ") + "Lab environment destroyed. Nothing of it exists anymore.")
+
+
+def cmd_reset(args):
+    if not args:
+        die("Usage: ctf reset <lab>")
+    cmd_start(args, reset=True)
+
+
+def cmd_hint(args):
+    if not args:
+        die("Usage: ctf hint <challenge>")
+    prof = require_profile()
+    chs = challenges()
+    cid = args[0]
+    if cid not in chs:
+        die(f"Unknown challenge '{cid}'. See `ctf list`.")
+    ch = chs[cid]
+    used = hints_used().get(cid, 0)
+    hints = ch.get("hints", [])
+    if not hints:
+        die("No hints available for this challenge.")
+    for i in range(min(used, len(hints))):
+        print(dim(f"  Hint {i + 1}: {hints[i]}"))
+    if used >= len(hints):
+        print(yellow("  That was the last hint. Ask your instructor if you are still stuck."))
+        return
+    level = used + 1
+    print(yellow(f"  Hint {level}/{len(hints)}: ") + hints[level - 1])
+    with open(LOG, "a") as fh:
+        fh.write(json.dumps({"type": "hint", "challenge": cid, "level": level, "ts": now()}) + "\n")
+    print(dim("  (Hints are free. HQ just keeps count.)"))
+    git_save(f"ctf: hint {cid} #{level}", [LOG])
+    _ = prof
+
+
+def cmd_submit(args):
+    if len(args) < 2:
+        die("Usage: ctf submit <challenge> NEBULA{...}")
+    guard_not_template()
+    require_profile()
+    cid, flag = args[0], " ".join(args[1:]).strip().strip("'\"")
+    chs = challenges()
+    if cid not in chs:
+        die(f"Unknown challenge '{cid}'. See `ctf list`.")
+    if cid in solved():
+        print(green("✔ ") + f"You already captured {cid}. Nice try, though.")
+        return
+    if not re.fullmatch(r"NEBULA\{[a-z0-9_]+\}", flag):
+        die("That does not look like a flag. Flags look like NEBULA{some_words_1a2b3c4d5e6f}.")
+
+    env = dict(os.environ, NEBULA_USER=login())
+    r = subprocess.run([AGENT, "verify", cid, flag], env=env)
+    if r.returncode != 0:
+        print(red("✖ ") + "Incorrect flag. " + dim("Check for typos, or try `ctf hint " + cid + "`."))
+        sys.exit(1)
+
+    ch = chs[cid]
+    with open(LOG, "a") as fh:
+        fh.write(json.dumps({"type": "solve", "challenge": cid, "flag": flag, "ts": now()}) + "\n")
+    total = sum(chs[c]["points"] for c in solved() if c in chs)
+    print()
+    print(green("  ★ FLAG CAPTURED ★  ") + bold(f"{ch['title']}") + yellow(f"  +{ch['points']} pts"))
+    print(dim(f"  Total: {total} pts"))
+    git_save(f"ctf: solved {cid}", [LOG])
+    print()
+
+
+def cmd_check(args):
+    if not args:
+        die("Usage: ctf check <challenge>")
+    chs = challenges()
+    cid = args[0]
+    if cid not in chs:
+        die(f"Unknown challenge '{cid}'.")
+    ch = chs[cid]
+    if ch.get("type") != "task":
+        die(f"{cid} has no automatic check: find its flag and submit it.")
+    lab = get_lab(ch["lab"])
+    docker_ready()
+    if not container_running(lab["container"]):
+        die(f"{lab['id']} is not running. Start it with: ctf start {lab['id']}")
+    subprocess.run(["docker", "exec", "-u", lab.get("user", "root"), lab["container"],
+                    "/usr/local/lib/nebula-agent", "check", cid])
+
+
+def cmd_status(_args):
+    prof = load_json(PROFILE)
+    chs = challenges()
+    done = solved()
+    pts = sum(chs[c]["points"] for c in done if c in chs)
+    total = sum(c["points"] for c in chs.values())
+    print(magenta("\n  NEBULA :: cadet status"))
+    if prof:
+        print(f"  Agent:    {bold(prof['alias'])}   {dim('(' + login() + ')')}")
+    else:
+        print("  Agent:    " + yellow("not registered → ctf register"))
+    print(f"  Points:   {bold(str(pts))} / {total}")
+    print(f"  Flags:    {len(done)} / {len(chs)}")
+    pending = unsynced()
+    print("  Sync:     " + (green("up to date") if pending == 0 else yellow(f"{pending} commit(s) pending → ctf sync")))
+    url = config().get("scoreboard_url")
+    if url:
+        print("  Board:    " + cyan(url))
+    print()
+
+
+def cmd_sync(_args):
+    push(quiet=False)
+
+
+COMMANDS = {
+    "help": cmd_help, "register": cmd_register, "list": cmd_list, "mission": cmd_mission,
+    "start": cmd_start, "connect": cmd_connect, "stop": cmd_stop, "reset": cmd_reset,
+    "hint": cmd_hint, "submit": cmd_submit, "check": cmd_check, "status": cmd_status,
+    "sync": cmd_sync,
+}
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        return cmd_help([])
+    cmd = COMMANDS.get(args[0])
+    if not cmd:
+        print(red("✖ ") + f"Unknown command '{args[0]}'.")
+        return cmd_help([])
+    try:
+        cmd(args[1:])
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()
