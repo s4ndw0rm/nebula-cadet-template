@@ -1,6 +1,6 @@
 {
   "course": "Nebula Cadet Program",
-  "template_repo": "YOUR-USER/nebula-cadet-template",
-  "hq_bot": "YOUR-BOT-ACCOUNT",
-  "scoreboard_url": "https://YOUR-USER.github.io/nebula-scoreboard/"
+  "template_repo": "s4ndw0rm/nebula-cadet-template",
+  "hq_bot": "nebula-hq-cybolt-academy",
+  "scoreboard_url": "https://s4ndw0rm.github.io/nebula-scoreboard/"
 }
